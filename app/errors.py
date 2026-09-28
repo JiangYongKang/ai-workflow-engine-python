@@ -52,3 +52,8 @@ class FatalStepError(WorkflowError):
 
 class ResourceLimitError(WorkflowError):
     code = "resource_limit_exceeded"
+
+
+class ResumeLimitError(ResourceLimitError):
+    """单运行续跑次数超过配置上限。"""
+    code = "resume_limit_exceeded"

@@ -12,6 +12,7 @@ from typing import Any
 
 from app.errors import (
     ResourceLimitError,
+    ResumeLimitError,
     RunConflictError,
     RunForbiddenError,
     RunNotFoundError,
@@ -28,14 +29,18 @@ from app.validation import parse_definition, validate_definition
 
 class WorkflowService:
     def __init__(self, executor: Executor | None = None,
-                 max_steps_per_run: int = 64) -> None:
+                 max_steps_per_run: int = 64,
+                 max_resumes_per_run: int = 3) -> None:
         self._executor = executor or Executor()
         self._max_steps_per_run = max_steps_per_run
+        self._max_resumes_per_run = max_resumes_per_run
         self._lock = threading.Lock()
         self._runs: dict[str, RunRecord] = {}
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
+        # 续跑幂等：(caller, run_id, idempotency_key) -> resume_id
+        self._resume_idempotency: dict[tuple[str, str, str], str] = {}
 
     # ---- 提交 -----------------------------------------------------------
 
@@ -112,6 +117,66 @@ class WorkflowService:
             event.set()
         thread.join()
         return record
+
+    # ---- 失败续跑 --------------------------------------------------------
+
+    def resume(self, caller: str, run_id: str,
+               idempotency_key: str | None = None) -> tuple[str, RunRecord]:
+        """对已失败/超时的运行发起续跑，返回 (resume_id, record)。
+
+        - 仅运行的原提交者可以续跑，越权与不存在分别抛 RunForbidden / RunNotFound；
+        - 仅 FAILED / TIMED_OUT 终态可续跑；运行中、成功、取消等一律 RunConflict；
+        - 相同 (caller, run_id, idempotency_key) 重复请求只生效一次，
+          返回同一个 resume_id；
+        - 并发续跑（无幂等键或键不同）只允许一个成功，其余 RunConflict；
+        - 单运行续跑次数受 max_resumes_per_run 约束，超限抛 ResumeLimitError。
+        """
+        record = self.get_run(caller, run_id)  # 复用「不存在/越权」校验
+
+        if idempotency_key is not None:
+            with self._lock:
+                existing = self._resume_idempotency.get(
+                    (caller, run_id, idempotency_key))
+            if existing is not None:
+                return existing, record  # 幂等命中，返回一致的结果标识
+
+        resume_id = uuid.uuid4().hex
+        new_event = threading.Event()
+        thread = threading.Thread(
+            target=self._executor.run, args=(record, new_event),
+            name=f"resume-{run_id[:8]}", daemon=True)
+
+        with self._lock:
+            if idempotency_key is not None:
+                # 锁内二次检查，挡住同键并发
+                existing = self._resume_idempotency.get(
+                    (caller, run_id, idempotency_key))
+                if existing is not None:
+                    return existing, record
+
+            with record.lock:
+                if record.status not in (RunStatus.FAILED, RunStatus.TIMED_OUT):
+                    raise RunConflictError(
+                        f"运行当前状态 {record.status.value}，"
+                        f"仅失败/超时的运行可以续跑")
+                if record.resume_count >= self._max_resumes_per_run:
+                    raise ResumeLimitError(
+                        f"续跑次数 {record.resume_count} 已达单运行上限 "
+                        f"{self._max_resumes_per_run}，拒绝再次续跑")
+                # 先重置步骤状态，再翻运行状态：临界区内不存在半更新的中间态
+                self._executor.reset_for_resume(record)
+                record.resume_count += 1
+                record.reason = f"第 {record.resume_count} 次续跑中"
+                record.status = RunStatus.RUNNING
+
+            if idempotency_key is not None:
+                self._resume_idempotency[(caller, run_id, idempotency_key)] = resume_id
+            # 替换上一轮的 cancel event / thread；旧线程早在终态时已退出
+            self._cancel_events[run_id] = new_event
+            self._threads[run_id] = thread
+
+        thread.start()
+        return resume_id, record
 
     # ---- 测试辅助 -------------------------------------------------------
 

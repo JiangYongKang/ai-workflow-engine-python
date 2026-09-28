@@ -34,6 +34,7 @@ _STATUS_BY_CODE = {
     "missing_dependency": 422,
     "duplicate_step_id": 422,
     "resource_limit_exceeded": 413,
+    "resume_limit_exceeded": 413,
     "run_not_found": 404,
     "run_forbidden": 403,
     "run_conflict": 409,
@@ -53,6 +54,10 @@ class SubmitRequest(BaseModel):
     idempotency_key: str | None = None
 
 
+class ResumeRequest(BaseModel):
+    idempotency_key: str | None = None
+
+
 def _serialize(record: RunRecord) -> dict[str, Any]:
     with record.lock:
         return {
@@ -60,6 +65,7 @@ def _serialize(record: RunRecord) -> dict[str, Any]:
             "owner": record.owner,
             "status": record.status.value,
             "reason": record.reason,
+            "resume_count": record.resume_count,
             "steps": {
                 sid: {
                     "status": r.status.value,
@@ -86,6 +92,13 @@ def get_run(run_id: str, x_owner: str = Header(default="anonymous")) -> dict[str
 @app.post("/runs/{run_id}/cancel")
 def cancel_run(run_id: str, x_owner: str = Header(default="anonymous")) -> dict[str, Any]:
     return _serialize(service.cancel(x_owner, run_id))
+
+
+@app.post("/runs/{run_id}/resume")
+def resume_run(run_id: str, req: ResumeRequest,
+               x_owner: str = Header(default="anonymous")) -> dict[str, Any]:
+    resume_id, record = service.resume(x_owner, run_id, req.idempotency_key)
+    return {"run_id": record.run_id, "resume_id": resume_id}
 
 
 @app.get("/health")

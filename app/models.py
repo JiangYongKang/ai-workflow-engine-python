@@ -69,4 +69,8 @@ class RunRecord:
     status: RunStatus = RunStatus.PENDING
     steps: dict[str, StepRecord] = field(default_factory=dict)
     reason: str | None = None
+    # 已成功续跑（resume）的次数，受服务级上限约束
+    resume_count: int = 0
+    # 步骤幂等副作用账本：跨续跑轮次保留，保证同一逻辑副作用不重复生效
+    effects: dict[str, Any] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)

@@ -72,11 +72,35 @@ class Executor:
             return _AttemptOutcome(
                 error=FatalStepError(f"动作执行异常（已归一化）: {type(exc).__name__}"))
 
+    # ---- 续跑：状态重置 --------------------------------------------------
+
+    def reset_for_resume(self, record: RunRecord) -> list[str]:
+        """续跑开始前把未成功步骤打回 PENDING，返回待重试步骤 id 列表。
+
+        已 SUCCEEDED 的步骤（及其结果、幂等账本）原样保留；
+        上一轮 FAILED / TIMED_OUT / SKIPPED / CANCELLED / 仍 PENDING 的步骤
+        清空 attempts/output/error 后重新进入调度，下游一旦上游补齐即自动放行。
+
+        调用方必须已持有 record.lock（与运行状态翻转处于同一临界区）。
+        """
+        retry_ids: list[str] = []
+        for rec in record.steps.values():
+            if rec.status is StepStatus.SUCCEEDED:
+                # 成功结果直接沿用，不重跑；清掉重试过程中可能残留的旧错误
+                rec.error = None
+                continue
+            rec.status = StepStatus.PENDING
+            rec.attempts = 0
+            rec.output = None
+            rec.error = None
+            retry_ids.append(rec.step_id)
+        return retry_ids
+
     # ---- 主调度循环 -----------------------------------------------------
 
     def run(self, record: RunRecord, cancel_event: threading.Event) -> None:
         deadline = time.monotonic() + self.run_timeout_seconds
-        effects: dict[str, Any] = {}
+        effects = record.effects  # 幂等账本挂在运行记录上，跨续跑轮次保留
         deps = {s.step_id: set(s.depends_on) for s in record.definition.steps}
         step_defs = {s.step_id: s for s in record.definition.steps}
         attempts_left = {
@@ -112,6 +136,7 @@ class Executor:
                         if outcome.error is None:
                             rec.status = StepStatus.SUCCEEDED
                             rec.output = outcome.output
+                            rec.error = None  # 清掉重试过程中残留的旧错误
                             continue
                         err = outcome.error
                         rec.error = f"{err.code}: {err}"
@@ -210,3 +235,4 @@ class Executor:
                     record.reason = f"步骤失败: {sorted(failed)}"
                 else:
                     record.status = RunStatus.SUCCEEDED
+                    record.reason = None  # 续跑补跑成功后不再残留上一轮的失败原因
