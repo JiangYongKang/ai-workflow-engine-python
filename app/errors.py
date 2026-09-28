@@ -38,6 +38,21 @@ class RunConflictError(WorkflowError):
     code = "run_conflict"
 
 
+class ResumeNotAllowedError(WorkflowError):
+    """运行不在可续跑状态（未结束，或终态不为失败/超时）。"""
+    code = "resume_not_allowed"
+
+
+class ResumeConflictError(WorkflowError):
+    """已有续跑在推进中（并发续跑只允许一个生效）。"""
+    code = "resume_conflict"
+
+
+class ResumeLimitExceededError(WorkflowError):
+    """单个运行的续跑次数超过配置上限。"""
+    code = "resume_limit_exceeded"
+
+
 class StepTimeoutError(WorkflowError):
     code = "step_timeout"
 

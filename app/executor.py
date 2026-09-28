@@ -58,27 +58,65 @@ class Executor:
         params["_effect_ledger"] = effects
         key = step_def.idempotency_key
         if key is not None and key in effects:
-            # 幂等命中：副作用已生效过，直接返回缓存结果，不再调用动作
-            return _AttemptOutcome(output={"recorded": key,
-                                           "count": effects[key],
-                                           "idempotent_hit": True})
+            # 幂等命中：副作用已生效过，直接返回首次的真实输出，不再调用动作
+            return _AttemptOutcome(output=record.effect_outputs[key])
+        seen_before = set(effects)
         try:
             action = get_action(step_def.action)
             output = counted_call(step_def.action, action, params)
-            return _AttemptOutcome(output=output)
         except WorkflowError as exc:  # 已归一化的错误类型
+            self._note_side_effect(record, effects, key, seen_before)
             return _AttemptOutcome(error=exc)
         except Exception as exc:  # 底层异常归一化为不可重试失败，不原样透出
+            self._note_side_effect(record, effects, key, seen_before)
             return _AttemptOutcome(
                 error=FatalStepError(f"动作执行异常（已归一化）: {type(exc).__name__}"))
+        if key is not None:
+            with record.lock:
+                if key not in effects:
+                    # 动作未自行记账时，以 1 作为“该逻辑副作用已执行一次”的哨兵
+                    effects[key] = 1
+                record.effect_outputs.setdefault(key, output)
+        return _AttemptOutcome(output=output)
+
+    @staticmethod
+    def _note_side_effect(record: RunRecord, effects: dict[str, Any],
+                          key: str | None, seen_before: set[str]) -> None:
+        """动作在抛错前已写入新副作用（“效果生效但响应丢失”）：登记账本，
+        使后续重试/续跑命中幂等缓存而不是再产生一次副作用。"""
+        if key is None or key in seen_before or key not in effects:
+            return
+        with record.lock:
+            record.effect_outputs.setdefault(
+                key, {"recorded": key, "count": effects[key],
+                      "idempotent_hit": True})
 
     # ---- 主调度循环 -----------------------------------------------------
 
-    def run(self, record: RunRecord, cancel_event: threading.Event) -> None:
+    def run(self, record: RunRecord, cancel_event: threading.Event,
+            resume: bool = False) -> None:
         deadline = time.monotonic() + self.run_timeout_seconds
-        effects: dict[str, Any] = {}
+        # 副作用账本持久化在运行记录上：续跑复用上一轮的账本，
+        # 带 idempotency_key 的步骤命中缓存后不再真正执行动作
+        effects = record.effects
         deps = {s.step_id: set(s.depends_on) for s in record.definition.steps}
         step_defs = {s.step_id: s for s in record.definition.steps}
+
+        if resume:
+            # 续跑重置：已成功的步骤沿用上一轮结果（不动 output），
+            # 清掉可能残留的旧错误描述；其余步骤（失败/超时/跳过/取消/
+            # 异常残留的运行中）全部回到 PENDING，重新获得完整重试预算
+            with record.lock:
+                record.reason = None
+                for rec in record.steps.values():
+                    if rec.status is StepStatus.SUCCEEDED:
+                        rec.error = None
+                    else:
+                        rec.status = StepStatus.PENDING
+                        rec.attempts = 0
+                        rec.output = None
+                        rec.error = None
+
         attempts_left = {
             sid: min(step_defs[sid].max_retries, self.max_retries_cap) for sid in deps
         }

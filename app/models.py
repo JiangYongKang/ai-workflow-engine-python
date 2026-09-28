@@ -69,4 +69,11 @@ class RunRecord:
     status: RunStatus = RunStatus.PENDING
     steps: dict[str, StepRecord] = field(default_factory=dict)
     reason: str | None = None
+    # 持久化的副作用账本：跨轮次保留，续跑时带 idempotency_key 的步骤命中后
+    # 不再真正执行，保证同一逻辑副作用只生效一次
+    effects: dict[str, Any] = field(default_factory=dict)
+    # 幂等步骤首次执行的真实输出缓存：key -> output，跨轮次复用
+    effect_outputs: dict[str, Any] = field(default_factory=dict)
+    # 已成功发起过的续跑次数（0 表示尚未续跑）
+    resume_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
