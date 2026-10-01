@@ -150,6 +150,9 @@ class Executor:
                         if outcome.error is None:
                             rec.status = StepStatus.SUCCEEDED
                             rec.output = outcome.output
+                            # 最终成功以最新结果为准：清掉之前任何一次尝试
+                            # （含上一轮续跑前）留下的失败/超时描述
+                            rec.error = None
                             continue
                         err = outcome.error
                         rec.error = f"{err.code}: {err}"
